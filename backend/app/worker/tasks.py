@@ -1,3 +1,4 @@
+import json
 import logging
 from datetime import datetime
 from pathlib import Path
@@ -12,7 +13,22 @@ from app.services.audio import extract_audio
 from app.services.clip_detection import detect_clip_candidates
 from app.services.clip_generator import generate_clip
 from app.services.embeddings import embedding_service
-from app.services.wisper_transcription import transcribe_audio
+from app.services.subtitle_style import SubtitleStyle
+from app.services.subtitles import (
+    build_subtitle_data_sync,
+    write_subtitle_file,
+)
+from app.services.transcript_saver import save_transcript_with_words
+from app.services.video_renderer import (
+    RenderOptions,
+    VideoEffectConfig,
+    video_renderer,
+)
+from app.services.wisper_transcription import (
+    release_model,
+    transcribe_audio,
+)
+from app.services.word_timestamps import ensure_word_timestamps
 from app.services.youtube_downloader import download_video
 from app.services.youtube_transcription import get_youtube_transcript
 from app.worker.celery_app import celery_app
@@ -242,8 +258,10 @@ def process_video(video_id: int, job_id: int):
                 len(transcript),
             )
 
+            release_model()
+
         # =================================
-        # 6. Save transcript segments
+        # 6. Save transcript segments (+ words)
         # =================================
 
         logger.info(
@@ -254,16 +272,18 @@ def process_video(video_id: int, job_id: int):
             len(transcript),
         )
 
-        for segment in transcript:
+        save_transcript_with_words(
+            db,
+            video_id=video.id,
+            transcript=transcript,
+        )
 
-            db.add(
-                TranscriptSegment(
-                    video_id=video.id,
-                    start_time=segment["start"],
-                    end_time=segment["end"],
-                    text=segment["text"],
-                )
-            )
+        db.commit()
+
+        ensure_word_timestamps(
+            db,
+            video_id=video.id,
+        )
 
         db.commit()
 
@@ -336,6 +356,8 @@ def process_video(video_id: int, job_id: int):
             len(embeddings),
         )
 
+        embedding_service.release()
+
         # =================================
         # 8. Detect clip candidates
         # =================================
@@ -385,6 +407,16 @@ def process_video(video_id: int, job_id: int):
         # =================================
         # 9. Save ClipCandidate records
         # =================================
+
+        # Re-processing a video must not duplicate clips. Remove any
+        # previously generated candidates/clips for this video first.
+        db.query(ClipCandidate).filter(
+            ClipCandidate.video_id == video.id
+        ).delete(synchronize_session=False)
+        db.query(Clip).filter(
+            Clip.video_id == video.id
+        ).delete(synchronize_session=False)
+        db.flush()
 
         saved_candidates = []
 
@@ -590,7 +622,33 @@ def process_video(video_id: int, job_id: int):
             )
 
         # =================================
-        # 12. Processing completed
+        # 12. Queue rendering of final clips
+        # =================================
+
+        logger.info(
+            "Queuing clip rendering: "
+            "video_id=%s clips=%s",
+            video_id,
+            len(generated_clips),
+        )
+
+        db.flush()
+
+        for clip in generated_clips:
+
+            render_clip.delay(
+                clip.id,
+            )
+
+        logger.info(
+            "Clip rendering queued: "
+            "video_id=%s clips=%s",
+            video_id,
+            len(generated_clips),
+        )
+
+        # =================================
+        # 13. Processing completed
         # =================================
 
         video.status = "completed"
@@ -661,6 +719,262 @@ def process_video(video_id: int, job_id: int):
                 "video_id=%s job_id=%s",
                 video_id,
                 job_id,
+            )
+
+        raise
+
+    finally:
+
+        db.close()
+
+
+# =================================
+# Rendering task
+# =================================
+
+SUBTITLE_STYLE_DEFAULTS = {
+    "font_name": "Noto Sans",
+    "font_size": 90,
+    "primary_color": "#FFFFFF",
+    "highlight_color": "#FFD700",
+    "dimmed_color": "#AAAAAA",
+    "outline_color": "#000000",
+    "outline_width": 4.0,
+    "background_color": "#80000000",
+    "bold": True,
+    "position": "lower_center",
+    "animation": "word_highlight",
+    "words_per_line": 3,
+    "margin_v": 400,
+    "safe_margin_x": 60,
+}
+
+
+def make_default_subtitle_style() -> SubtitleStyle:
+    return SubtitleStyle(**SUBTITLE_STYLE_DEFAULTS)
+
+
+@celery_app.task(bind=True, max_retries=3, acks_late=True)
+def render_clip(
+    self,
+    clip_id: int,
+):
+    """
+    Render the final, polished version of a clip.
+
+    Flow:
+        Clip generated
+        → generate subtitles (ASS)
+        → apply video effects (9:16, zoom, motion)
+        → render final MP4
+        → update Clip status + rendered_file_path
+
+    The task is idempotent: if the clip is already rendered, it returns
+    early. Failures set status = "failed" with useful error info and the
+    task may be retried.
+    """
+    logger.info(
+        "Starting clip rendering: clip_id=%s",
+        clip_id,
+    )
+
+    db = SessionLocal()
+
+    try:
+        clip = db.get(Clip, clip_id)
+
+        if clip is None:
+            raise ValueError(
+                f"Clip not found: clip_id={clip_id}"
+            )
+
+        # Idempotency guard: already rendered? nothing to do.
+        if clip.status == "rendered" and clip.rendered_file_path:
+            logger.info(
+                "Clip already rendered: clip_id=%s",
+                clip_id,
+            )
+            return {
+                "clip_id": clip_id,
+                "status": "rendered",
+                "output": clip.rendered_file_path,
+            }
+
+        # ---------------------------------
+        # Mark rendering in progress
+        # ---------------------------------
+
+        clip.status = "rendering"
+        clip.render_error = None
+        db.commit()
+
+        logger.info(
+            "Clip rendering started: clip_id=%s status=%s",
+            clip_id,
+            clip.status,
+        )
+
+        # ---------------------------------
+        # Resolve source + output paths
+        # ---------------------------------
+
+        source_path = Path(clip.file_path)
+
+        if not source_path.exists():
+            raise FileNotFoundError(
+                f"Raw clip file not found: {source_path}"
+            )
+
+        video_link = db.get(Video, clip.video_id)
+        if video_link is None:
+            raise ValueError(
+                f"Video not found: video_id={clip.video_id}"
+            )
+
+        output_dir = (
+            Path("storage")
+            / "videos"
+            / str(clip.video_id)
+            / "clips"
+            / "rendered"
+        )
+
+        output_dir.mkdir(parents=True, exist_ok=True)
+
+        output_path = (
+            output_dir
+            / f"clip_{clip.id:03d}_final.mp4"
+        )
+
+        # ---------------------------------
+        # Build subtitles from transcript words
+        # ---------------------------------
+
+        style = make_default_subtitle_style()
+
+        if clip.subtitle_style:
+            try:
+                overrides = json.loads(clip.subtitle_style)
+            except json.JSONDecodeError:
+                overrides = {}
+
+            if overrides:
+                style = SubtitleStyle.from_dict(overrides)
+                logger.info(
+                    "Using per-clip subtitle style overrides: "
+                    "clip_id=%s overrides=%s",
+                    clip_id,
+                    overrides,
+                )
+
+        subtitle_data = build_subtitle_data_sync(
+            db,
+            clip,
+            style=style,
+        )
+
+        subtitle_file = None
+
+        if subtitle_data.lines:
+            # ASS enables animated word highlighting.
+            subtitle_file = write_subtitle_file(
+                subtitle_data,
+                output_dir / f"clip_{clip.id:03d}.ass",
+                fmt="ass",
+                width=1080,
+                height=1920,
+            )
+
+            logger.info(
+                "Subtitles generated: clip_id=%s lines=%s file=%s",
+                clip_id,
+                len(subtitle_data.lines),
+                subtitle_file,
+            )
+
+        # ---------------------------------
+        # Configure rendering
+        # ---------------------------------
+
+        effects = VideoEffectConfig(
+            vertical_9_16=True,
+            width=1080,
+            height=1920,
+            zoom=0.0,
+            motion="push_in",
+            vivid=True,
+        )
+
+        options = RenderOptions(
+            output_path=output_path,
+            subtitle_file=subtitle_file,
+            effects=effects,
+            crf=23,
+            preset="medium",
+        )
+
+        # ---------------------------------
+        # Render
+        # ---------------------------------
+
+        video_renderer.render(
+            source_path,
+            options,
+        )
+
+        # ---------------------------------
+        # Mark rendered
+        # ---------------------------------
+
+        clip.rendered_file_path = str(output_path)
+        clip.status = "rendered"
+        clip.render_error = None
+
+        db.commit()
+
+        logger.info(
+            "Clip rendered successfully: clip_id=%s output=%s",
+            clip_id,
+            output_path,
+        )
+
+        return {
+            "clip_id": clip_id,
+            "status": "rendered",
+            "output": str(output_path),
+        }
+
+    except Exception as exc:
+
+        db.rollback()
+
+        logger.exception(
+            "Clip rendering failed: clip_id=%s",
+            clip_id,
+        )
+
+        try:
+            clip = db.get(Clip, clip_id)
+            if clip:
+                clip.status = "failed"
+                clip.render_error = str(exc)
+                db.commit()
+        except Exception:
+            db.rollback()
+            logger.exception(
+                "Failed to update render failure status: "
+                "clip_id=%s",
+                clip_id,
+            )
+
+        # Retry with backoff unless we've exhausted attempts.
+        retries = getattr(self, "request", None)
+        max_retries = self.max_retries
+
+        if retries and retries.retries < max_retries:
+            raise self.retry(
+                exc=exc,
+                countdown=30 * (retries.retries + 1),
             )
 
         raise

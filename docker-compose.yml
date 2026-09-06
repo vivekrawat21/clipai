@@ -22,6 +22,18 @@ services:
     ports:
       - "6380:6379"
 
+  flower:
+    image: mher/flower:2.0.1
+    container_name: clip-ai-flower
+    restart: unless-stopped
+    command: celery --broker=redis://redis:6379/0 flower --port=5555
+    environment:
+      TZ: UTC
+    depends_on:
+      - redis
+    ports:
+      - "5555:5555"
+
 volumes:
   postgres_data:
 

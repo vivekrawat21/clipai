@@ -12,23 +12,45 @@ MODEL_NAME = "all-MiniLM-L6-v2"
 class EmbeddingService:
     """
     Service responsible for generating semantic text embeddings.
+
+    The model is loaded lazily on first use so that importing this module
+    (e.g. at Celery worker startup) does not occupy several hundred MB of
+    RAM in the idle main process. Each prefork child loads its own copy only
+    when it actually runs an embedding step.
     """
 
     def __init__(self):
-        logger.info(
-            "Loading embedding model: %s",
-            MODEL_NAME,
-        )
+        self._model = None
 
-        self.model = SentenceTransformer(
-            MODEL_NAME,
-            device="cpu",
-        )
+    @property
+    def model(self) -> SentenceTransformer:
+        if self._model is None:
+            logger.info(
+                "Loading embedding model: %s",
+                MODEL_NAME,
+            )
 
-        logger.info(
-            "Embedding model loaded successfully: %s",
-            MODEL_NAME,
-        )
+            self._model = SentenceTransformer(
+                MODEL_NAME,
+                device="cpu",
+            )
+
+            logger.info(
+                "Embedding model loaded successfully: %s",
+                MODEL_NAME,
+            )
+
+        return self._model
+
+    def release(self) -> None:
+        """Drop the cached model so its memory can be reclaimed.
+
+        Safe to call after the embedding step completes; the model is
+        lazily reloaded on the next use.
+        """
+        if self._model is not None:
+            logger.info("Releasing embedding model: %s", MODEL_NAME)
+            self._model = None
 
     def generate_embedding(
         self,

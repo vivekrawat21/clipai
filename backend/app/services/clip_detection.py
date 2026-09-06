@@ -344,7 +344,7 @@ def detect_clip_candidates(
 
     candidates = select_best_candidates(
         candidates,
-        max_candidates=10,
+        max_candidates=5,
         overlap_threshold=0.5,
         min_score=0.30,
         min_gap=15.0,

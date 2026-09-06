@@ -39,6 +39,7 @@ async def create_video(
             status_code=400,
             detail="Invalid YouTube URL",
         )
+        
 
     logger.info(
         "Creating video: youtube_id=%s",
@@ -59,8 +60,8 @@ async def create_video(
             video.id,
             youtube_id,
         )
-
-        return video
+        if video.status in {"pending", "processing", "completed"}:
+            return video
 
     # 3. Create Video
     video = Video(

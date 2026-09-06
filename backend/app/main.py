@@ -4,6 +4,8 @@ from app.api.videos import router as videos_router
 from app.core.logging import setup_logging
 import logging
 from app.api.clips import router as clips_router
+from app.api.social import router as social_router
+from app.api.publishing import router as publishing_router
 
 setup_logging()
 
@@ -16,7 +18,8 @@ app = FastAPI(
 app.add_middleware(
     CORSMiddleware,
     allow_origins=[
-        "http://localhost:3000"
+        "http://localhost:3000",
+        "http://127.0.0.1:3000",
     ],
     allow_credentials=True,
     allow_methods=["*"],
@@ -25,6 +28,8 @@ app.add_middleware(
 
 app.include_router(videos_router)
 app.include_router(clips_router)
+app.include_router(social_router)
+app.include_router(publishing_router)
 
 @app.get("/")
 async def root():

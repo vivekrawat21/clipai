@@ -1,0 +1,66 @@
+# Taskfile — dev tooling for ClipAI.
+#
+# The three long-running pieces are:
+#   api    → FastAPI backend   (http://127.0.0.1:8000)
+#   worker → Celery task worker (clip generation, rendering, publishing)
+#   web    → Next.js frontend   (http://localhost:3000)
+#
+# Quick start:
+#   task dev        # run all three together (Ctrl+C stops everything)
+#   task api        # run only the backend
+#   task worker     # run only the celery worker
+#   task web        # run only the frontend
+#   task logs       # tail all three log files
+#   task status     # systemd unit status (if installed)
+version: "3"
+
+tasks:
+  dev:
+    desc: Run the API, Celery worker and Next.js frontend together
+    cmds:
+      - |
+        bash -c '
+        trap "kill 0 2>/dev/null" EXIT INT TERM
+        task api >/tmp/clipai-api.log 2>&1 &
+        task worker >/tmp/clipai-worker.log 2>&1 &
+        task web >/tmp/clipai-web.log 2>&1 &
+        echo "ClipAI: 3 services starting (Ctrl+C to stop)"
+        echo "  API      -> http://127.0.0.1:8000   log /tmp/clipai-api.log"
+        echo "  Worker   -> celery log /tmp/clipai-worker.log"
+        echo "  Frontend -> http://localhost:3000   log /tmp/clipai-web.log"
+        wait
+        '
+
+  api:
+    desc: Run the FastAPI backend on :8000 (auto-reload)
+    dir: backend
+    cmds:
+      - uv run uvicorn app.main:app --host 127.0.0.1 --port 8000 --reload
+
+  worker:
+    desc: Run the Celery worker
+    dir: backend
+    cmds:
+      - uv run celery -A app.worker.celery_app:celery_app worker --loglevel=INFO -c 1 --prefetch-multiplier=1
+
+  web:
+    desc: Run the Next.js frontend (dev server)
+    dir: frontend
+    cmds:
+      - pnpm dev
+
+  logs:
+    desc: Tail the three service logs
+    cmds:
+      - |
+        tail -f /tmp/clipai-api.log /tmp/clipai-worker.log /tmp/clipai-web.log
+
+  status:
+    desc: Show systemd status for the three ClipAI units
+    cmds:
+      - systemctl --user list-units --type=service --no-legend | grep -E "clipai-(api|celery|web)"
+
+  restart:
+    desc: Restart the installed systemd units (api, celery, web)
+    cmds:
+      - systemctl --user restart clipai-api clipai-celery clipai-web
